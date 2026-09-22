@@ -1,0 +1,1296 @@
+---
+title: "clusters&severity"
+author: "Cezar-Fabian Moise, Center for Molecular Prediction of Inflammatory Bowel Disease - PREDICT, Department of Clinical Medicine, Aalborg University Copenhagen."
+date: "2026-05-01"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+```
+
+### Loading packages and preparing data.
+```{r, message=F, warning=F}
+# Load packages.
+library(tidyverse)
+library(data.table)
+library(knitr)
+library(vegan)
+library(nlme)
+library(ggpubr)
+library(kableExtra)
+library(broom)
+library(purrr)
+library(pheatmap)
+library(mixOmics)
+library(pROC)
+library(glmnet)
+library(survival)
+library(Rtsne)
+library(ggstance)
+library(car)
+library(tableone)
+library(extrafont)
+library(openxlsx)
+library(factoextra)
+library(cluster)
+library(Rtsne)
+library(ggrepel)
+library(FactoMineR)
+library(mixOmics)
+library(dbscan)
+library(energy)
+library(caret)
+library(glmnet)
+library(reshape2)
+library(ggpubr)
+library(Boruta)
+library(pls)
+library(pROC)
+library(kernlab)
+library(ranger)
+library(xgboost)
+library(e1071)
+library(ComplexHeatmap)
+library(circlize)
+library(here)
+
+# Load metadatas and join.
+metadata1 <- fread(here("data", "metadata_serum_metabolomics.csv")) %>%
+    dplyr::select(lbnr, SampleName)
+metadata2 <- fread(here("data", "metadata_serum_metabolomics_cleaned.csv")) %>%
+    dplyr::select(diagnosis_phase,SampleName,SampleAge,final_diag,sex,YearsBetween,age_at_sampling) %>%
+    left_join(y = metadata1, by = "SampleName")  
+
+# Load raw metabolite data.    
+raw <- fread(here("data", "ft_all_quant_blankrm_imp_rsdremoved_waveica_ms2_20240815_log.csv")) %>%
+    filter(SampleName %in% metadata2$SampleName) %>%
+    dplyr::select(-V1) %>%
+    as_tibble() 
+
+# Load severity information for CD and UC.  
+cd_severity_metadata = fread(here("data", "cd_severity_metadata.csv")) %>%
+  dplyr::select(lbnr, severity) %>%
+  mutate(severity = case_when(severity %in% c("Mild","Moderate") ~ "Non-Severe", severity == "Severe" ~ "Severe"))
+uc_severity_metadata = fread(here("data", "uc_severity_metadata.csv")) %>% 
+  dplyr::select(lbnr, severity) %>%
+  mutate(severity = case_when(severity %in% c("Mild", "Moderate") ~ "Non-Severe", severity == "Severe" ~ "Severe"))
+severity_metadata = bind_rows(cd_severity_metadata, uc_severity_metadata)
+
+# Join raw data and metadata.
+data <- metadata2 %>% 
+  left_join(raw, by = "SampleName") %>%
+  dplyr::select(-c(batch)) %>% 
+  column_to_rownames("SampleName") %>% 
+  rename_with(~paste0("X", .x), .cols = matches("^\\d")) %>% 
+  mutate_all(~ replace(., is.na(.), 0)) %>%
+  left_join(y = severity_metadata, by = "lbnr")
+
+# Rearrange dataset and scale.
+raw1 <- data[, c(1:7, 4907, 8:2917)]
+raw1 <- scale(raw1[, 9:2918])
+raw1[raw1>5] <- 5
+raw1[raw1< -5] <- -5
+raw2 = cbind.data.frame(data[, c(1:7,4907)], raw1)
+raw2 = as.data.frame(raw2) %>% 
+  mutate(final_diag = case_when(str_starts(final_diag, "UC") ~ "UC",
+                              str_starts(final_diag, "CD") ~ "CD",
+                              T ~ final_diag))
+
+# Filter for patients existing in both metadatas
+cd_patients = raw2 %>%
+  filter(final_diag == "CD")
+uc_patients = raw2 %>%
+  filter(final_diag == "UC")
+raw2 = raw2 %>%
+  filter(lbnr %in% c(cd_severity_metadata$lbnr, uc_severity_metadata$lbnr))
+
+# Filter for the "Around Diagnosis" timepoint
+raw2_around_diag = raw2 %>%
+  filter(diagnosis_phase == "AroundDiagnosis2Y") %>%
+  column_to_rownames(var = "lbnr")
+
+# Load main annotations
+annotations <- readxl::read_excel(here("data", "prediag_ibd_serum_annotations_250211.xlsx")) %>%
+    dplyr::select("Metabolite ID","Annotation", "Metabolite class") %>%
+    rename("MetID" = "Metabolite ID") %>%
+    mutate(MetID = paste0("X", MetID))
+
+# Define annotation update function
+update_annotations <- function(main_df, file_path, metid_col = 1, annot_col, class_col) {
+    fread(file_path) %>%
+        dplyr::select(all_of(c(metid_col, annot_col, class_col))) %>%
+        rename("Annotation" = !!names(.)[2], "Metabolite class" = !!names(.)[3]) %>%
+        mutate(
+            MetID = paste0("X", .data[[names(.)[1]]]),
+            across(where(is.character), ~ {
+                case_when(is.na(.) | . %in% c("0", "#N/A", "") ~ NA_character_, TRUE ~ .)
+            }),
+            across(where(is.numeric), ~ {
+                case_when(is.na(.) | . == 0 ~ NA_real_, TRUE ~ .)
+            })
+        ) %>%
+        dplyr::select(MetID, Annotation, `Metabolite class`) %>%
+        group_by(MetID) %>%
+        slice_head(n = 1) %>%
+        ungroup()
+}
+
+# Apply updates sequentially
+annotations <- rows_patch(annotations, update_annotations(annotations, here("new_annotations_23.02.csv"), 1, 2, 3), by = "MetID", unmatched = "ignore")
+annotations <- rows_patch(annotations, update_annotations(annotations, here("Metabolites_sig_clusters.csv"), 1, 11, 8), by = "MetID", unmatched = "ignore")
+
+# Cohort Characteristics
+patient_demo_around_diag <- raw2_around_diag %>%
+    group_by(final_diag) %>%
+    summarise(
+        med_age           = median(SampleAge, na.rm = TRUE),
+        sd_age            = sd(SampleAge, na.rm = TRUE),
+        med_agesampling   = median(age_at_sampling, na.rm = TRUE),
+        sd_agesampling    = sd(age_at_sampling, na.rm = TRUE),
+        n_males           = sum(sex == "Male", na.rm = TRUE),
+        n_females         = sum(sex == "Female", na.rm = TRUE),
+        n_total           = n(),
+        n_severe          = sum(severity == "Severe", na.rm = TRUE),
+        n_non_severe      = sum(severity == "Non-Severe", na.rm = TRUE),
+        .groups = "drop"
+    ) %>%
+    mutate(
+        age_diag = sprintf("%.1f ± %.1f", med_age, sd_age),
+        age_sampling = sprintf("%.1f ± %.1f", med_agesampling, sd_agesampling)
+    ) %>%
+    rename(IBD_subtype = final_diag) %>%
+   dplyr::select(1, 6:12)
+patient_demo_around_diag
+```
+
+### Dimensionality Reduction and Data Linearity Evaluation
+``` {r, message=F, warning=F}
+
+# New data frames for dimensionality reduction:
+raw3 = raw2_around_diag %>%
+  dplyr::select(-c(1:7))
+raw4 = t(raw3)
+
+# Patient-based
+
+# Run PCA.
+pca_raw3 = prcomp((raw3))
+pca_raw3_df = as.data.frame(pca_raw3$x) %>%
+  rownames_to_column(var = "lbnr") %>%
+  left_join(y = severity_metadata %>% mutate(lbnr = as.character(lbnr)), by = "lbnr")
+# Compute variance explained by first two PCs.
+pc1_var = round(summary(pca_raw3)$importance[2,1]*100, 1)
+pc2_var = round(summary(pca_raw3)$importance[2,2]*100, 1)
+
+# Plot patients by severity.
+pca_plot2 <- ggplot(pca_raw3_df, aes(PC1, PC2, colour = severity)) +
+    geom_point(size = 2) +
+    scale_colour_manual(values = c("Non-Severe" = "#A5BC64", "Severe" = "#85416E"), name = "Severity") +
+    labs(x = paste0("PC1 (", pc1_var, "%)"), y = paste0("PC2 (", pc2_var, "%)")) +
+    theme_bw(base_size = 12) + 
+    theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.5),
+          axis.line = element_line(colour = "black"), panel.grid = element_blank())
+pca_plot2
+
+set.seed(5)
+
+# Run UMAP and plot patients by severity.
+umap_raw3 = umap::umap(d = (raw3))
+umap_raw3_df = as.data.frame(umap_raw3$layout) %>%
+  rownames_to_column(var = "lbnr") %>%
+  left_join(y = severity_metadata %>% mutate(lbnr = as.character(lbnr)), by = "lbnr")
+umap_plot2 <- ggplot(umap_raw3_df, aes(V1, V2, colour = severity)) +
+    geom_point(size = 2) +
+    scale_colour_manual(values = c("Non-Severe" = "#A5BC64", "Severe" = "#85416E"), name = "Severity") +
+    labs(x = "UMAP1", y = "UMAP2") +  # Fixed: added missing )
+    theme_bw(base_size = 12) + 
+    theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.5),
+          axis.line = element_line(colour = "black"), panel.grid = element_blank())
+umap_plot2
+
+# Metabolite-based 
+
+# Run PCA with metabolites as rows.
+pca_raw4 = prcomp(raw4)
+pca_raw4_df = pca_raw4$x
+# Compute variance explained by first two PCs.
+pc1_var = round(summary(pca_raw4)$importance[2,1]*100, 1)
+pc2_var = round(summary(pca_raw4)$importance[2,2]*100, 1)
+
+# Plot metabolite PCA:
+pca_plot3 <- ggplot(pca_raw4_df, aes(PC1, PC2, colour = "#FF906D")) +
+    geom_point(size = 1) +
+    labs(x = paste0("PC1 (", pc1_var, "%)"), y = paste0("PC2 (", pc2_var, "%)")) +
+    theme_bw(base_size = 12) + 
+    theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.5),
+          axis.line = element_line(colour = "black"), panel.grid = element_blank(),
+          legend.position = "none")
+pca_plot3
+
+set.seed(5)
+
+# Run tSNE with 2000 iteration and plot metabolites:
+tsne = Rtsne(t(raw3), dims = 2, perplexity = 30, theta = 0.0, max_iter = 2000, verbose = F)
+tsne_coords <- data.frame(
+    tsne1 = tsne$Y[,1],
+    tsne2 = tsne$Y[,2],
+    lbnr = rownames(t(raw3)),
+    diagnosis_phase = "AroundDiagnosis2Y")
+tsne = ggplot(tsne_coords, aes(x = tsne1, y = tsne2)) +
+    geom_point(size = 0.4,colour = "#FF906D") +
+    labs(title = "t-SNE: AroundDiagnosis2Y Features",
+         x = "t-SNE 1", y = "t-SNE 2") +
+    theme_bw(base_size = 12) +
+    theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.5),
+          axis.line = element_line(colour = "black"), panel.grid = element_blank(),
+          legend.position = "none",
+          plot.title = element_blank())
+tsne
+
+set.seed(5)
+# Run UMAP with metabolites as rows + plot in the clustering section.
+umap_raw4 = umap::umap(d = raw4)
+umap_raw4 = as.data.frame(umap_raw4$layout)
+
+# Distance correlation for entire cohort.
+# X_metabolites = raw3
+# X_metabolites = as.matrix(apply(X_metabolites, 2, as.numeric))
+# y_severity = raw2_around_diag$severity
+# y_severity_num <- matrix(as.numeric(y_severity == "Severe"), ncol=1)
+# dcor.test(X_metabolites, y_severity_num, R = 4999)
+
+# Distance correlation for CD cohort.
+# cd_dcor = raw2_around_diag %>% filter(final_diag == "CD") %>% dplyr::select(7)
+# X_metabolites_cd = raw2_around_diag %>% filter(final_diag == "CD") %>% dplyr::select(8:2916)
+# X_metabolites_cd = as.matrix(apply(X_metabolites_cd, 2, as.numeric))
+# y_severity = cd_dcor$severity
+# y_severity_num <- matrix(as.numeric(y_severity == "Severe"), ncol=1)
+# dcor.test(X_metabolites_cd, y_severity_num, R = 4999)
+
+# Distance correlation for UC cohort.
+# uc_dcor = raw2_around_diag %>% filter(final_diag == "UC") %>% dplyr::select(7)
+# X_metabolites_uc = raw2_around_diag %>% filter(final_diag == "UC") %>% dplyr::select(8:2916)
+# X_metabolites_uc = as.matrix(apply(X_metabolites_uc, 2, as.numeric))
+# y_severity = uc_dcor$severity
+# y_severity_num <- matrix(as.numeric(y_severity == "Severe"), ncol=1)
+# dcor.test(X_metabolites_uc, y_severity_num, R = 4999)
+
+# Regression vs RF for linearity checks
+
+# X_metabolites_t <- raw3
+# y_severity = raw2_around_diag$severity
+# y_severity_num <- matrix(as.numeric(y_severity == "Severe"), ncol=1)
+
+# Extract patient_data for modeling:
+# patient_data <- data.frame(
+#     severity = y_severity_num,  # or y_severity_num
+#     X_metabolites_t  # all metabolites as predictors
+# )
+# 
+# patient_data$severity = factor(patient_data$severity)
+# 
+# Logistic regression
+# logistic_mod <- train(
+#     severity ~ .,
+#     data = patient_data,
+#     method = "glm",
+#     family = "binomial",           # <- explicitly logistic
+#     trControl = trainControl(method = "cv", number = 5),
+#     metric = "Accuracy"
+# )
+# 
+# Random Forest
+# rf_mod <- train(
+#     severity ~ .,
+#     data = patient_data,
+#     method = "rf",
+#     trControl = trainControl(method = "cv", number = 5),
+#     metric = "Accuracy"
+# )
+
+# Cross‑validation resampling
+# res <- resamples(list(Logistic = logistic_mod, RF = rf_mod))
+# res$values
+
+```
+
+### Metabolite clustering 
+``` {r, message=F,warning=F} 
+
+# Use stable UMAP coordinates and plot.
+umap_raw5 = fread(here("data", "umap_coord_seed5.csv")) 
+names(umap_raw5) = make.unique(names(umap_raw5))
+umap_raw5 = umap_raw5 %>%
+  rename("MetID" = "V1",
+         "V1" = "V1.1")
+
+# Plot metabolite UMAP:
+umap_plot3 <- ggplot(umap_raw5, aes(V1, V2)) +
+    geom_point(size = 0.2, ,colour = "#FF906D") +
+    labs(x = "UMAP1", y = "UMAP2") +
+    theme_bw(base_size = 12) + 
+    theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.5),
+          axis.line = element_line(colour = "black"), panel.grid = element_blank(),
+          legend.position = "none")
+umap_plot3
+
+# Run HDBSCAN unsupervised clustering (minimum cluster size = 10 metabolites).
+metabolite_hdb = hdbscan(umap_raw5[, c(2,3)], minPts = 10)
+
+# Filter for non-null membership strength.
+metabolite_clusters = umap_raw5 %>%
+  filter(!membership_strength == 0)
+
+# Declare data frame for cluster validation.
+cluster_ids = unique(metabolite_clusters$hdbscan_cluster)
+intra_cluster_distances = data.frame(hdbscan_cluster = cluster_ids,
+                                      mean_correl = NA_real_,
+                                     correl_z = NA)   
+
+set.seed(5)
+n_random = 1000   
+
+# Run loop: compute correlation between clusters and compare with random sets.
+for (i in seq_along(cluster_ids)) {
+  
+  cid = cluster_ids[i]
+  
+  met_in_cluster = metabolite_clusters$MetID[metabolite_clusters$hdbscan_cluster == cid]
+  k = length(met_in_cluster)
+  
+  mat = raw4[met_in_cluster, , drop = F]
+  
+  cor_mat = cor(t(mat))
+  dist_cor = 1 - cor_mat
+  mean_correl = mean(dist_cor[upper.tri(dist_cor)])
+  
+  # Randomization to compare
+  rand_cor = replicate(n_random, {
+    rand_mets = sample(rownames(raw4), k)
+    cor_r = cor(t(raw4[rand_mets, , drop = F]))
+    mean(1 - cor_r[upper.tri(cor_r)])
+  })  
+  
+  # Compute Z-score equivalents.
+  intra_cluster_distances$mean_correl[i] = mean_correl
+  intra_cluster_distances$correl_z[i] = (mean_correl - mean(rand_cor)) / sd(rand_cor)
+    
+}
+
+# Pull all clusters
+selected_clusters = intra_cluster_distances %>%
+  pull(hdbscan_cluster)
+selected_metabolites = metabolite_clusters %>% 
+  filter(hdbscan_cluster %in% selected_clusters) %>%
+  dplyr::select(1, 4,5)
+
+# Compute cluster score per sample by using membership strengths as weights:
+cluster_ids = sort(unique(selected_metabolites$hdbscan_cluster))
+module_scores = matrix(NA, nrow = length(cluster_ids), ncol = ncol(raw4))
+rownames(module_scores) = paste0("Cluster_", cluster_ids)
+colnames(module_scores) = colnames(raw4)
+
+for (cid in cluster_ids) {
+  
+  cluster_mets = metabolite_clusters %>%
+    filter(hdbscan_cluster == cid)
+  
+  m_ids = cluster_mets$MetID
+  weights = cluster_mets$membership_strength
+  mat = raw4[m_ids, , drop = FALSE]
+  
+  weighted_scores = apply(mat, 2, function(x)
+    sum(x * weights) / sum(weights))
+  
+  module_scores[paste0("Cluster_", cid), ] = weighted_scores
+}
+
+raw5_cluster_scores = as.data.frame(module_scores)
+
+# Prepare data frames for modelling: fresh metadata, fresh cluster scores data frame containing "severity" column.
+metadata3 = raw2_around_diag[, c(1:7)] %>%
+  rownames_to_column(var = "lbnr")
+raw6_severity = as.data.frame(t(raw5_cluster_scores)) %>%
+  rownames_to_column(var = "lbnr")
+metadata_for_raw6 = metadata3[, c("final_diag", "lbnr")] 
+raw6_severity = left_join(x = raw6_severity, y = metadata_for_raw6, by = "lbnr")
+
+# Actual data frames for modelling: X and y (for both CD and UC)
+raw6_severity = left_join(x = raw6_severity, y = severity_metadata %>% mutate(lbnr = as.character(lbnr)), by = "lbnr") 
+
+cd_logistic = raw6_severity %>%
+  filter(final_diag == "CD") %>%
+  mutate(severity_bin = ifelse(severity == "Severe", 1, 0))
+cluster_cols_cd_logistic = grep("^Cluster", colnames(cd_logistic), value = T)
+X_cd = scale(as.matrix(cd_logistic[, cluster_cols_cd_logistic]))
+y_cd = cd_logistic$severity_bin
+
+uc_logistic = raw6_severity %>%
+  filter(final_diag == "UC") %>%
+  mutate(severity_bin = ifelse(severity == "Severe", 1, 0))
+cluster_cols_uc_logistic = grep("^Cluster", colnames(uc_logistic), value = T)
+X_uc = scale(as.matrix(uc_logistic[, cluster_cols_uc_logistic]))
+y_uc = uc_logistic$severity_bin
+
+# Perform Boruta here and store results for subsequent validation.
+
+# Boruta on CD and UC 
+boruta_clusters_cd = as.data.frame(t(raw5_cluster_scores)) %>%
+  rownames_to_column("lbnr") %>%
+  mutate(lbnr = as.integer(lbnr)) %>%
+  left_join(y = as.data.frame(cd_severity_metadata), by = "lbnr") %>%
+  column_to_rownames("lbnr") %>%
+  drop_na()
+boruta_clusters_uc = as.data.frame(t(raw5_cluster_scores)) %>%
+  rownames_to_column("lbnr") %>%
+  mutate(lbnr = as.integer(lbnr)) %>%
+  left_join(y = as.data.frame(uc_severity_metadata), by = "lbnr") %>%
+  column_to_rownames("lbnr") %>%
+  drop_na()
+
+boruta_clusters_cd$severity = factor(boruta_clusters_cd$severity)
+boruta_clusters_uc$severity = factor(boruta_clusters_uc$severity)
+
+# Run algorithm with 500 runs and fix uncertain clusters.
+set.seed(1000)
+boruta_clusters_cd_res = Boruta(severity ~ ., data = boruta_clusters_cd, doTrace = 1, maxRuns = 500)
+boruta_clusters_uc_res = Boruta(severity ~ ., data = boruta_clusters_uc, doTrace = 1, maxRuns = 500)
+
+boruta_clusters_cd_res_final <- TentativeRoughFix(boruta_clusters_cd_res)
+boruta_clusters_cd_res_final_confirmed_mets <- getSelectedAttributes(boruta_clusters_cd_res_final)
+
+boruta_clusters_uc_res_final <- TentativeRoughFix(boruta_clusters_uc_res)
+boruta_clusters_uc_res_final_confirmed_mets <- getSelectedAttributes(boruta_clusters_uc_res_final)
+
+boruta_clusters_cd_res_final_confirmed_mets
+boruta_clusters_uc_res_final_confirmed_mets
+```
+
+### Performing correlations between clusters and metadata variables.
+```{r, message=F,warning=F}
+# Correlation with metadata
+raw7 = as.data.frame(t(raw5_cluster_scores)) %>%
+  rownames_to_column("lbnr")
+metadata4 = raw2_around_diag[, c(1:7)] %>%
+  rownames_to_column(var = "lbnr")
+merged_raw7_metadata = inner_join(metadata4, raw7, by = "lbnr")
+
+# Correlation with continuous variables (Sample Age, Age at Diagnosis, Years Between Sampling and Diagnosis):
+
+numeric_meta = merged_raw7_metadata %>%
+  dplyr::select(where(is.numeric))
+cor_mat_cont = cor(numeric_meta, use = "pairwise.complete.obs", method = "spearman")
+cluster_vars = grep("^Cluster", colnames(cor_mat_cont), value = T)
+meta_vars = setdiff(colnames(cor_mat_cont), cluster_vars)
+
+cor_df = as.data.frame(as.table(cor_mat_cont[meta_vars, cluster_vars]))
+colnames(cor_df) = c("metadata", "cluster", "correlation")
+
+# Assign p-values
+p_mat = matrix(NA, nrow = length(meta_vars), ncol = length(cluster_vars),
+               dimnames = list(meta_vars, cluster_vars))
+for (i in seq_along(meta_vars)) {  # Fixed: use i not m twice
+    m <- meta_vars[i]
+    for (c in cluster_vars) {
+        test <- cor.test(merged_raw7_metadata[[m]], merged_raw7_metadata[[c]], method = "spearman")
+        p_mat[m, c] <- test$p.value
+    }
+}
+
+# Adjust p-values per metadata variable
+p_df = as.data.frame(as.table(p_mat))
+colnames(p_df) = c("metadata", "cluster", "p_value")
+cor_df = merge(cor_df, p_df, by = c("metadata", "cluster")) %>%
+  group_by(metadata) %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+  ungroup()
+
+# Correlation with categorical variables (Time-to-Diagnosis, Sex, Disease Subtype):
+
+# Declare new column based on time between sampling and diagnosis:
+raw7 <- raw7 %>%
+  left_join(metadata3, by = "lbnr") %>%
+  mutate(
+    time_to_diag = case_when(
+      YearsBetween < 0 ~ "before",
+      YearsBetween == 0 ~ "diag",
+      YearsBetween > 0 ~ "after",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Perform Kruskal-Wallis (for 3 groups) and adjust p-values:
+kruskal_results_clusterscores_yearsdiag <- map_dfr(
+  colnames(raw7[, -c(1, 62:69)]),
+  function(v) {
+    test <- kruskal.test(raw7[[v]] ~ raw7$time_to_diag)
+    data.frame(
+      variable = v,
+      H_statistic = unname(test$statistic),
+      p_value = test$p.value
+    )}) %>%
+  mutate(
+  metadata_var = "time_to_diag",
+  p_adj = p.adjust(p_value, method = "fdr"))
+# No significant associations between cluster scores and time-to-diag after adjustment.
+
+# For sex use Kruskal-Wallis:
+kruskal_results_clusterscores_sex <- map_dfr(colnames(raw7[, -1]), function(c) {
+    test <- kruskal.test(raw7[[c]] ~ metadata4$sex)
+    data.frame(
+        variable = c,
+        H_statistic = test$statistic,  # Kruskal-Wallis H (like F)
+        p_value = test$p.value
+    )})
+# Adjust p-values:
+kruskal_results_clusterscores_sex$metadata_var <- "sex"
+rownames(kruskal_results_clusterscores_sex) = NULL
+kruskal_results_clusterscores_sex = kruskal_results_clusterscores_sex %>%
+  mutate(p_adj = p.adjust(p_value, "fdr"))
+
+# For diagnosis use Kruskal-Wallis:
+kruskal_results_clusterscores_finaldiag <- map_dfr(colnames(raw7[, -1]), function(c) {
+    test <- kruskal.test(raw7[[c]] ~ metadata4$final_diag)
+    data.frame(
+        variable = c,
+        H_statistic = test$statistic,
+        p_value = test$p.value
+    )})
+
+# Adjust p-values:
+kruskal_results_clusterscores_finaldiag$metadata_var <- "final_diag"
+rownames(kruskal_results_clusterscores_finaldiag) = NULL
+kruskal_results_clusterscores_finaldiag = kruskal_results_clusterscores_finaldiag %>%
+  mutate(p_adj = p.adjust(p_value, "fdr"))
+
+# Extract only significant correlations:
+
+cor_df_sign = cor_df %>%
+  filter(p_adj <= 0.05)
+kruskal_results_clusterscores_finaldiag_sign = kruskal_results_clusterscores_finaldiag %>%
+  filter(p_adj <= 0.05)
+kruskal_results_clusterscores_sex_sign = kruskal_results_clusterscores_sex %>%
+  filter(p_adj <= 0.05)
+
+# For categorical metadata, build correlation data frames for further plotting:
+sign_correl_Cl_finaldiag = (kruskal_results_clusterscores_finaldiag_sign$variable)
+kruskal_results_clusterscores_finaldiag_sign_for_plot = merged_raw7_metadata %>%
+  dplyr::select(final_diag, all_of(sign_correl_Cl_finaldiag)) %>%
+  pivot_longer(cols = all_of(sign_correl_Cl_finaldiag),
+               names_to = "cluster",
+               values_to = "score")
+
+sign_correl_Cl_sex = (kruskal_results_clusterscores_sex_sign$variable)
+kruskal_results_clusterscores_sex_sign_for_plot = merged_raw7_metadata %>%
+  dplyr::select(sex, all_of(sign_correl_Cl_sex)) %>%
+  pivot_longer(cols = all_of(sign_correl_Cl_sex),
+               names_to = "cluster",
+               values_to = "score")
+
+boxplots_finaldiag_cluster = ggplot(kruskal_results_clusterscores_finaldiag_sign_for_plot, aes(x = final_diag, y = score, fill = final_diag)) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~ cluster, scales = "free_y") +
+  scale_fill_manual(values = c("CD" = "#CD68AB", "UC" = "#B1CD64")) +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+boxplots_finaldiag_cluster
+
+boxplots_sex_cluster = ggplot(kruskal_results_clusterscores_sex_sign_for_plot, aes(x = sex, y = score, fill = sex)) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~ cluster, scales = "free_y") +
+  scale_fill_manual(values = c("Male" = "#C2C6B5", "Female" = "#85416E")) +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+boxplots_sex_cluster
+```
+
+### Models 1 and 2: Sparse PLS-DA and Kernel PLS-DA.
+``` {r, message=F,warning=F} 
+# CD #
+
+# First, Sparse PLS-DA
+
+# Ensure factor labels & binary numeric vector
+y_cd <- factor(cd_logistic$severity_bin, levels = c(0, 1), labels = c("Non-Severe", "Severe"))
+target_class <- "Severe"
+y_bin_true <- as.numeric(y_cd == target_class)
+
+# Parameters
+ncomp <- 2
+keepX_grid <- c(5, 10, 15, 20)
+n_outer <- 5
+n_inner <- 5
+N <- length(y_cd)
+
+set.seed(842)
+
+# Setup outer folds
+outer_folds <- createFolds(y_cd, k = n_outer, list = TRUE)
+
+oof_prob_splsda <- numeric(N)
+best_keepX_per_fold <- numeric(n_outer)
+
+# Track variable selection counts across outer folds
+var_selection_counts <- setNames(rep(0, ncol(X_cd)), colnames(X_cd))
+
+# Matrix to hold loadings across outer fold best models
+outer_fold_loadings <- matrix(
+  0, 
+  nrow = ncol(X_cd), 
+  ncol = n_outer,
+  dimnames = list(colnames(X_cd), paste0("Fold_", 1:n_outer))
+)
+
+# Nested Cross-Validation loop
+for (k in 1:n_outer) {
+  test_idx  <- outer_folds[[k]]
+  train_idx <- setdiff(1:N, test_idx)
+  
+  X_train_outer <- X_cd[train_idx, ]
+  y_train_outer <- y_cd[train_idx]
+  X_test_outer  <- X_cd[test_idx, ]
+  
+  # Inner Loop
+  inner_folds <- createFolds(y_train_outer, k = n_inner, list = TRUE)
+  inner_auc_results <- numeric(length(keepX_grid))
+  names(inner_auc_results) <- paste0("keepX_", keepX_grid)
+  
+  for (idx in seq_along(keepX_grid)) {
+    kv <- keepX_grid[idx]
+    inner_oof_probs <- numeric(length(y_train_outer))
+    
+    for (ik in 1:n_inner) {
+      inner_test_idx  <- inner_folds[[ik]]
+      inner_train_idx <- setdiff(seq_along(y_train_outer), inner_test_idx)
+      
+      # Fit sPLS-DA on inner training split
+      fit_inner <- mixOmics::splsda(
+        X_train_outer[inner_train_idx, , drop=F], 
+        y_train_outer[inner_train_idx],
+        ncomp = ncomp, 
+        keepX = rep(kv, ncomp)
+      )
+      
+      # Predict on inner test split
+      pred_inner <- predict(fit_inner, X_train_outer[inner_test_idx, ,drop=F])
+      inner_oof_probs[inner_test_idx] <- pred_inner$predict[, target_class, ncomp]
+    }
+    
+    # Inner Evaluation: Calculate AUC to pick the best keepX
+    roc_inner <- roc(y_train_outer, inner_oof_probs, levels = levels(y_cd), quiet = TRUE)
+    inner_auc_results[idx] <- as.numeric(auc(roc_inner))
+  }
+  
+  # Select best keepX for this outer fold
+  best_keepX <- keepX_grid[which.max(inner_auc_results)]
+  best_keepX_per_fold[k] <- best_keepX
+  
+  # Outer Evaluation
+  best_outer_fit <- mixOmics::splsda(
+    X_train_outer, 
+    y_train_outer, 
+    ncomp = ncomp, 
+    keepX = rep(best_keepX, ncomp)
+  )
+  
+  # Extract loadings & variable selections from outer fold model
+  comp1_loadings <- best_outer_fit$loadings$X[, 1]
+  outer_fold_loadings[, k] <- comp1_loadings
+  
+  selected_vars <- mixOmics::selectVar(best_outer_fit, comp = 1)$name
+  var_selection_counts[selected_vars] <- var_selection_counts[selected_vars] + 1
+  
+  # Predict probabilities on outer test fold
+  pred_outer <- predict(best_outer_fit, X_test_outer)
+  oof_prob_splsda[test_idx] <- pred_outer$predict[, target_class, ncomp]
+}
+
+# Performance metrics
+oof_pred_class <- factor(ifelse(oof_prob_splsda >= 0.5, "Severe", "Non-Severe"), levels = levels(y_cd))
+
+roc_splsda    <- roc(y_cd, oof_prob_splsda, levels = c("Non-Severe", "Severe"))
+auc_splsda    <- as.numeric(auc(roc_splsda))
+auc_ci_splsda <- ci.auc(roc_splsda, method = "bootstrap", boot.n = 2000)
+
+cm_splsda       <- table(Truth = y_cd, Pred = oof_pred_class)
+brier_splsda    <- mean((oof_prob_splsda - y_bin_true)^2)
+rmse_splsda     <- sqrt(brier_splsda)
+accuracy_splsda <- mean(oof_pred_class == y_cd)
+
+perf_splsda_cd <- list(
+  accuracy = accuracy_splsda,
+  auc      = auc_splsda,
+  auc_ci   = auc_ci_splsda,
+  brier    = brier_splsda,
+  rmse     = rmse_splsda,
+  confusion_matrix    = cm_splsda,
+  best_keepX_per_fold = best_keepX_per_fold
+)
+
+# Mean absolute loadings across outer fold best models
+mean_abs_loadings <- rowMeans(abs(outer_fold_loadings))
+selection_stability <- (var_selection_counts / n_outer) * 100
+
+imp_scores_splsda_cd <- data.frame(
+  Feature          = colnames(X_cd),
+  Mean_Abs_Loading = mean_abs_loadings,
+  CV_Stability_Pct = selection_stability,
+  row.names        = NULL
+)
+imp_scores_splsda_cd <- imp_scores_splsda_cd[order(-imp_scores_splsda_cd$Mean_Abs_Loading), ]
+
+# Directionality calculation relative to OOF predicted probabilities
+top_splsda_cd <- imp_scores_splsda_cd$Feature[1:min(10, nrow(imp_scores_splsda_cd))]
+splsda_direction_cd <- sapply(top_splsda_cd, function(cl) {
+  cor(X_cd[, cl], oof_prob_splsda, use = "complete.obs")
+})
+
+
+# Second, Kernel PLS-DA for CD. Same workflow applied to UC.
+
+# Prepare target and feature Data
+y_cd <- factor(cd_logistic$severity_bin, levels = c(0, 1), labels = c("Non-Severe", "Severe"))
+target_class <- "Severe"
+y_bin_true <- as.numeric(y_cd == target_class)
+
+X_mat <- scale(as.matrix(cd_logistic[, cluster_cols_cd_logistic])) # Pre-scaled features
+N <- nrow(X_mat)
+
+# Kernel Transformation Function
+rbf_kernel_cd <- function(X_tr, X_te = NULL, gamma = 0.01) {
+  rbf <- rbfdot(sigma = gamma)
+  if (is.null(X_te)) {
+    return(as.matrix(kernelMatrix(rbf, X_tr)))
+  } else {
+    # Matrix shape: [N_test x N_train]
+    return(as.matrix(kernelMatrix(rbf, X_te, X_tr)))
+  }
+}
+
+# Parameters & Grid Definition
+tune_grid_kpls <- expand.grid(
+  gamma = c(0.001, 0.005, 0.01, 0.05),
+  ncomp = c(1, 2, 3, 4)
+)
+
+n_outer <- 5
+n_inner <- 5
+
+set.seed(842)
+
+# Outer fold
+outer_folds <- createFolds(y_cd, k = n_outer, list = TRUE)
+
+oof_prob_kpls <- numeric(N)
+best_params_per_fold <- vector("list", n_outer)
+
+perm_imp_matrix_kpls <- matrix(
+  0, 
+  nrow = n_outer, 
+  ncol = ncol(X_mat),
+  dimnames = list(paste0("Fold_", 1:n_outer), colnames(X_mat))
+)
+
+# Nested CV loop
+for (k in 1:n_outer) {
+  test_idx  <- outer_folds[[k]]
+  train_idx <- setdiff(1:N, test_idx)
+  
+  X_train_outer <- X_mat[train_idx, , drop = FALSE]
+  y_train_outer <- y_bin_true[train_idx]
+  y_train_outer_factor <- y_cd[train_idx]
+  
+  X_test_outer  <- X_mat[test_idx, , drop = FALSE]
+  y_test_outer  <- y_bin_true[test_idx]
+  
+  # Inner loop
+  inner_folds <- createFolds(y_train_outer_factor, k = n_inner, list = TRUE)
+  inner_auc_results <- numeric(nrow(tune_grid_kpls))
+  
+  for (g_idx in 1:nrow(tune_grid_kpls)) {
+    cur_gamma <- tune_grid_kpls$gamma[g_idx]
+    cur_ncomp <- tune_grid_kpls$ncomp[g_idx]
+    
+    inner_oof_probs <- numeric(length(y_train_outer))
+    
+    for (ik in 1:n_inner) {
+      inner_test_idx  <- inner_folds[[ik]]
+      inner_train_idx <- setdiff(seq_along(y_train_outer), inner_test_idx)
+      
+      X_tr_in <- X_train_outer[inner_train_idx, , drop = FALSE]
+      y_tr_in <- y_train_outer[inner_train_idx]
+      X_te_in <- X_train_outer[inner_test_idx, , drop = FALSE]
+      
+      K_tr_in <- rbf_kernel_cd(X_tr_in, NULL, gamma = cur_gamma)
+      K_te_in <- rbf_kernel_cd(X_tr_in, X_te_in, gamma = cur_gamma)
+      
+      pls_fit_in <- plsr(y_tr_in ~ K_tr_in, ncomp = cur_ncomp, scale = FALSE)
+      
+      pred_in <- as.numeric(predict(pls_fit_in, newdata = K_te_in, ncomp = cur_ncomp))
+      inner_oof_probs[inner_test_idx] <- pred_in
+    }
+    
+    # Evaluate inner grid model using AUC
+    roc_in <- roc(y_train_outer_factor, inner_oof_probs, levels = levels(y_cd), quiet = TRUE)
+    inner_auc_results[g_idx] <- as.numeric(auc(roc_in))
+  }
+  
+  # Select best hyperparameter set for this outer fold
+  best_grid_idx <- which.max(inner_auc_results)
+  best_gamma    <- tune_grid_kpls$gamma[best_grid_idx]
+  best_ncomp    <- tune_grid_kpls$ncomp[best_grid_idx]
+  best_params_per_fold[[k]] <- list(gamma = best_gamma, ncomp = best_ncomp)
+  
+  # Outer loop
+  K_train_outer <- rbf_kernel_cd(X_train_outer, NULL, gamma = best_gamma)
+  K_test_outer  <- rbf_kernel_cd(X_train_outer, X_test_outer, gamma = best_gamma)
+  
+  pls_fit_outer <- plsr(y_train_outer ~ K_train_outer, ncomp = best_ncomp, scale = FALSE)
+  
+  yhat_outer <- as.numeric(predict(pls_fit_outer, newdata = K_test_outer, ncomp = best_ncomp))
+  oof_prob_kpls[test_idx] <- yhat_outer
+  
+  # Permutation importance
+  base_fold_auc <- as.numeric(auc(y_test_outer, yhat_outer, quiet = TRUE))
+  
+  for (j in 1:ncol(X_mat)) {
+    X_test_perm <- X_test_outer
+    X_test_perm[, j] <- sample(X_test_perm[, j])
+    
+    K_test_perm <- rbf_kernel_cd(X_train_outer, X_test_perm, gamma = best_gamma)
+    yhat_perm   <- as.numeric(predict(pls_fit_outer, newdata = K_test_perm, ncomp = best_ncomp))
+    
+    auc_perm <- as.numeric(auc(y_test_outer, yhat_perm, quiet = TRUE))
+    perm_imp_matrix_kpls[k, j] <- base_fold_auc - auc_perm
+  }
+}
+
+# Performance metrics
+oof_pred_class <- factor(ifelse(oof_prob_kpls >= 0.5, "Severe", "Non-Severe"), levels = levels(y_cd))
+
+roc_kpls    <- roc(y_cd, oof_prob_kpls, levels = c("Non-Severe", "Severe"))
+auc_kpls    <- as.numeric(auc(roc_kpls))
+auc_ci_kpls <- ci.auc(roc_kpls, method = "bootstrap", boot.n = 2000)
+
+cm_kpls        <- table(Truth = y_cd, Pred = oof_pred_class)
+cm_result_kpls <- confusionMatrix(cm_kpls)
+
+brier_kpls <- mean((oof_prob_kpls - y_bin_true)^2)
+rmse_kpls  <- sqrt(brier_kpls)
+
+perf_kernel_plsda_cd <- list(
+  accuracy = mean(oof_pred_class == y_cd),
+  bal_acc  = as.numeric(cm_result_kpls$byClass["Balanced Accuracy"]),
+  auc      = auc_kpls,
+  auc_ci   = auc_ci_kpls,
+  brier    = brier_kpls,
+  rmse     = rmse_kpls,
+  confusion_matrix     = cm_kpls,
+  best_params_per_fold = best_params_per_fold
+)
+
+# Feature importance and directionality
+raw_avg_imp_kpls <- colMeans(perm_imp_matrix_kpls)
+cleaned_imp_kpls <- pmax(raw_avg_imp_kpls, 0)
+
+# Normalize importance to sum to 100%
+imp_total_kernel_plsda_cd <- (cleaned_imp_kpls / sum(cleaned_imp_kpls)) * 100
+
+top_kernel_cd <- names(sort(imp_total_kernel_plsda_cd, decreasing = TRUE))[1:min(10, length(imp_total_kernel_plsda_cd))]
+direction_kernel_cd <- sapply(top_kernel_cd, function(cl) {
+  cor(X_mat[, cl], oof_prob_kpls, use = "complete.obs")
+})
+```
+
+### Models 3 and 4: RF and XGB.
+``` {r, message=F,warning=F} 
+
+# RF for CD - UC Random Forest follows the exact same logic #
+
+cd_for_class_weighted_rf = cd_logistic[, c(cluster_cols_cd_logistic, "severity_bin")]
+cd_for_class_weighted_rf$severity_bin = as.factor(cd_for_class_weighted_rf$severity_bin)
+levels(cd_for_class_weighted_rf$severity_bin) = make.names(levels(cd_for_class_weighted_rf$severity_bin))
+
+set.seed(842)
+
+# Setup data and outer folds
+outer_folds <- createFolds(cd_for_class_weighted_rf$severity_bin, k = 5, list = TRUE)
+
+features <- setdiff(colnames(cd_for_class_weighted_rf), "severity_bin")
+rf_prob_oof_cd <- numeric(nrow(cd_for_class_weighted_rf))
+
+fold_importance_matrix <- matrix(
+  0, 
+  nrow = length(features), 
+  ncol = 5,
+  dimnames = list(features, paste0("Fold_", 1:5))
+)
+
+tune_grid <- expand.grid(
+  mtry = floor(sqrt(ncol(cd_for_class_weighted_rf) - 1)),
+  splitrule = c("gini", "extratrees"),
+  min.node.size = c(1, 3, 5, 10)
+)
+
+inner_control <- trainControl(
+  method = "cv", 
+  number = 5, 
+  classProbs = TRUE, 
+  summaryFunction = twoClassSummary
+)
+
+# Nested cross-validation loop
+for (k in 1:5) {
+  test_idx  <- outer_folds[[k]]
+  train_idx <- setdiff(seq_len(nrow(cd_for_class_weighted_rf)), test_idx)
+  
+  train_data <- cd_for_class_weighted_rf[train_idx, ]
+  test_data  <- cd_for_class_weighted_rf[test_idx, ]
+  
+  # Inner Loop
+  rf_inner_tuned <- train(
+    severity_bin ~ .,
+    data       = train_data,
+    method     = "ranger",
+    trControl  = inner_control,
+    tuneGrid   = tune_grid,
+    metric     = "ROC",
+    importance = "permutation",
+    num.trees  = 3000
+  )
+  
+  # Extract permutation importance from this fold's best model
+  fold_imp <- rf_inner_tuned$finalModel$variable.importance
+  fold_importance_matrix[names(fold_imp), k] <- fold_imp
+  
+  # Unbiased predictions on outer test fold
+  rf_prob_oof_cd[test_idx] <- predict(
+    rf_inner_tuned, 
+    newdata = test_data, 
+    type = "prob"
+  )[, 2]
+}
+
+# Extract ground truth binary labels
+target_level_2 <- levels(cd_for_class_weighted_rf$severity_bin)[2]
+y_true_rf_cd <- as.numeric(cd_for_class_weighted_rf$severity_bin == target_level_2)
+
+# Compute ROC, AUC, and CI
+roc_rf_cd <- roc(y_true_rf_cd, rf_prob_oof_cd)
+rf_auc_cv_cd <- as.numeric(auc(roc_rf_cd))
+rf_auc_ci_cd <- ci.auc(roc_rf_cd, method = "bootstrap", boot.n = 2000)
+
+# Other classification metrics
+rf_pred_class_cd <- ifelse(rf_prob_oof_cd >= 0.5, 1, 0)
+rf_accuracy_cd   <- mean(rf_pred_class_cd == y_true_rf_cd)
+rf_brier_cd      <- mean((rf_prob_oof_cd - y_true_rf_cd)^2)
+rf_rmse_cd       <- sqrt(mean((rf_prob_oof_cd - y_true_rf_cd)^2))
+
+mean_importance <- rowMeans(fold_importance_matrix)
+sd_importance   <- apply(fold_importance_matrix, 1, sd)
+
+importance_summary <- data.frame(
+  Feature         = names(mean_importance),
+  Mean_Importance = mean_importance,
+  SD_Importance   = sd_importance
+)
+importance_summary <- importance_summary[order(-importance_summary$Mean_Importance), ]
+
+# Directionality calculation for top 10 features
+top_rf_cd <- importance_summary$Feature[1:10]
+rf_direction_cd <- sapply(top_rf_cd, function(cl) {
+  cor(cd_for_class_weighted_rf[, cl], rf_prob_oof_cd, use = "complete.obs")
+})
+
+
+# XGBoost for CD #
+
+y_cd_num <- ifelse(ft9_severity_cd$severity == "Severe", 1, 0)
+X_cd_mat <- as.matrix(X_cd)
+
+outer_folds <- createFolds(y_cd_num, k = 5, list = TRUE)
+
+oof_pred_xgb_cd <- numeric(length(y_cd_num))
+features        <- colnames(X_cd_mat)
+
+# Track XGBoost Gain importance across all 5 outer folds
+fold_importance_matrix_xgb <- matrix(
+  0, 
+  nrow = length(features), 
+  ncol = 5,
+  dimnames = list(features, paste0("Fold_", 1:5))
+)
+
+params_grid_xgb_cd <- expand.grid(
+  eta              = c(0.01, 0.05),
+  max_depth        = c(2,4),
+  subsample        = c(0.7),
+  colsample_bytree = c(0.7, 0.8)
+)
+
+# Nested loop
+for (k in 1:5) {
+  test_idx  <- outer_folds[[k]]
+  train_idx <- setdiff(seq_len(length(y_cd_num)), test_idx)
+  
+  X_train_k <- X_cd_mat[train_idx, ]
+  y_train_k <- y_cd_num[train_idx]
+  X_test_k  <- X_cd_mat[test_idx, ]
+  
+  dtrain_k <- xgb.DMatrix(data = X_train_k, label = y_train_k)
+  dtest_k  <- xgb.DMatrix(data = X_test_k)
+  
+  # Calculate scale_pos_weight strictly within outer train fold
+  pos_weight_k <- sum(y_train_k == 0) / sum(y_train_k == 1)
+  
+  # Inner Loop
+  best_inner_auc  <- -1
+  best_inner_params <- list()
+  best_inner_nrounds <- 100
+  
+  for (i in seq_len(nrow(params_grid_xgb_cd))) {
+    p <- list(
+      objective        = "binary:logistic",
+      eval_metric      = "auc",
+      scale_pos_weight = pos_weight_k,
+      eta              = params_grid_xgb_cd$eta[i],
+      max_depth        = params_grid_xgb_cd$max_depth[i],
+      subsample        = params_grid_xgb_cd$subsample[i],
+      colsample_bytree = params_grid_xgb_cd$colsample_bytree[i]
+    )
+    
+    cv_inner <- xgb.cv(
+      params                = p,
+      data                  = dtrain_k,
+      nrounds               = 300,
+      nfold                 = 5,
+      early_stopping_rounds = 10,
+      verbose               = 0,
+      maximize              = TRUE
+    )
+    
+    max_auc_i  <- max(cv_inner$evaluation_log$test_auc_mean)
+    best_iter_i <- cv_inner$best_iteration
+    
+    if (max_auc_i > best_inner_auc) {
+      best_inner_auc     <- max_auc_i
+      best_inner_params  <- p
+      best_inner_nrounds <- best_iter_i
+    }
+  }
+  
+  xgb_fold_model <- xgb.train(
+    params  = best_inner_params,
+    data    = dtrain_k,
+    nrounds = best_inner_nrounds,
+    verbose = 0
+  )
+  
+  # Extract Feature Importance for this outer fold
+  imp_fold <- xgb.importance(feature_names = features, model = xgb_fold_model)
+  if (nrow(imp_fold) > 0) {
+    fold_importance_matrix_xgb[imp_fold$Feature, k] <- imp_fold$Gain
+  }
+  
+  # Predict on unseen outer test fold
+  oof_pred_xgb_cd[test_idx] <- predict(xgb_fold_model, dtest_k)
+}
+
+xgb_roc_cd    <- roc(y_cd_num, oof_pred_xgb_cd)
+final_auc_xgb_cd <- as.numeric(auc(xgb_roc_cd))
+xgb_auc_ci_cd <- ci.auc(xgb_roc_cd, method = "bootstrap", boot.n = 2000)
+
+xgb_pred_class_cd <- ifelse(oof_pred_xgb_cd >= 0.5, 1, 0)
+xgb_accuracy_cd   <- mean(xgb_pred_class_cd == y_cd_num)
+xgb_brier_cd      <- mean((oof_pred_xgb_cd - y_cd_num)^2)
+xgb_rmse_cd       <- sqrt(mean((oof_pred_xgb_cd - y_cd_num)^2))
+
+mean_imp_xgb <- rowMeans(fold_importance_matrix_xgb)
+sd_imp_xgb   <- apply(fold_importance_matrix_xgb, 1, sd)
+
+importance_summary_xgb <- data.frame(
+  Feature   = names(mean_imp_xgb),
+  Mean_Gain = mean_imp_xgb,
+  SD_Gain   = sd_imp_xgb
+)
+importance_summary_xgb <- importance_summary_xgb[order(-importance_summary_xgb$Mean_Gain), ]
+
+top_xgb_cd <- importance_summary_xgb$Feature[1:10]
+
+xgb_direction_cd <- sapply(top_xgb_cd, function(cl) {
+  cor(X_cd[, cl], oof_pred_xgb_cd, use = "complete.obs")
+})
+```
+
+# Clusters and active inflammation
+``` {r, message=F,warning=F} 
+
+# Prepare laboratory data for CD:
+lab_crp_calpro_cd = fread(here("data", "lab_for_cezar.csv")) %>%
+    filter(diagnosis_phase == "AroundDiagnosis2Y") %>%
+    filter(!is.na(protein)) %>%
+    filter(lbnr %in% cd_severity_metadata$lbnr) %>%
+    dplyr::select(1,4,5) %>%
+  pivot_wider(id_cols = lbnr, names_from = protein, values_from = lab_measure_value) %>%
+  mutate(lbnr = as.character(lbnr))
+
+crp_fcal_clusters_cd <- inner_join(lab_crp_calpro_cd,  # Your lab df
+                          raw6_severity %>% dplyr::select(lbnr, starts_with("Cluster_")),  # Your cluster df
+                          by = "lbnr") %>%
+    dplyr::select(-lbnr)  # Drop ID for cor matrix
+
+# Spearman correlations between clusters and CRP + Fcal.
+cluster_vars_cd <- grep("Cluster_", colnames(crp_fcal_clusters_cd), value = TRUE)
+cor_results_cd <- cor(crp_fcal_clusters_cd[, c("crp", "Fcal", cluster_vars_cd)], method = "spearman", use = "pairwise.complete.obs")
+
+biomarkers = c("crp","Fcal")
+# With p-values
+p_mat_cd <- matrix(NA, nrow = length(biomarkers), ncol = length(cluster_vars_cd),
+                dimnames = list(biomarkers, cluster_vars_cd))
+
+for (biomarker in biomarkers) {
+    for (cl in cluster_vars_cd) {
+        test <- cor.test(crp_fcal_clusters_cd[[biomarker]], crp_fcal_clusters_cd[[cl]],
+                         method = "spearman")
+        p_mat_cd[biomarker, cl] <- test$p.value
+    }
+}
+
+p_adj_cd <- p_mat_cd
+p_adj_cd["crp", ] <- p.adjust(p_mat_cd["crp", ], method = "fdr")
+p_adj_cd["Fcal", ] <- p.adjust(p_mat_cd["Fcal", ], method = "fdr")
+
+# Adjust p-values per marker and clean results.
+p_adj_df_cd <- p_adj_cd %>%
+    as.data.frame() %>%
+    rownames_to_column("variable") %>%
+    pivot_longer(-variable, names_to = "cluster", values_to = "p_adj")
+
+cor_tidy_cd <- cor_results_cd %>%
+    as.data.frame() %>%
+    rownames_to_column("variable") %>%
+    pivot_longer(-variable, names_to = "cluster", values_to = "rho") %>%
+    filter(variable %in% c("crp", "Fcal"))
+
+p_tidy_cd <- p_mat_cd %>%
+    as.data.frame() %>%
+    rownames_to_column("biomarker") %>%
+    pivot_longer(-biomarker, names_to = "cluster", values_to = "p_value") %>%
+    rename(variable = biomarker)
+
+final_results_cd <- cor_tidy_cd %>%
+    left_join(p_tidy_cd, by = c("variable", "cluster")) %>%
+    left_join(p_adj_df_cd, by = c("variable", "cluster")) %>%
+    arrange(variable, p_adj)
+
+# Prepare laboratory data for UC:
+lab_crp_calpro_uc = fread(here("data", "lab_for_cezar.csv")) %>%
+    filter(diagnosis_phase == "AroundDiagnosis2Y") %>%
+    filter(!is.na(protein)) %>%
+    filter(lbnr %in% uc_severity_metadata$lbnr) %>%
+    dplyr::select(1,4,5) %>%
+  pivot_wider(id_cols = lbnr, names_from = protein, values_from = lab_measure_value) %>%
+  mutate(lbnr = as.character(lbnr))
+
+crp_fcal_clusters_uc <- inner_join(lab_crp_calpro_uc,  # Your lab df
+                          raw6_severity %>% dplyr::select(lbnr, starts_with("Cluster_")),  # Your cluster df
+                          by = "lbnr") %>%
+    dplyr::select(-lbnr)  # Drop ID for cor matrix
+
+cluster_vars_uc <- grep("Cluster_", colnames(crp_fcal_clusters_uc), value = TRUE)
+cor_results_uc <- cor(crp_fcal_clusters_uc[, c("crp", "Fcal", cluster_vars_uc)], method = "spearman", use = "pairwise.complete.obs")
+
+biomarkers = c("crp","Fcal")
+# With p-values
+p_mat_uc <- matrix(NA, nrow = length(biomarkers), ncol = length(cluster_vars_uc),
+                dimnames = list(biomarkers, cluster_vars_uc))
+
+for (biomarker in biomarkers) {
+    for (cl in cluster_vars_uc) {
+        test <- cor.test(crp_fcal_clusters_uc[[biomarker]], crp_fcal_clusters_uc[[cl]],
+                         method = "spearman")
+        p_mat_uc[biomarker, cl] <- test$p.value
+    }
+}
+
+p_adj_uc <- p_mat_uc
+p_adj_uc["crp", ] <- p.adjust(p_mat_uc["crp", ], method = "fdr")
+p_adj_uc["Fcal", ] <- p.adjust(p_mat_uc["Fcal", ], method = "fdr")
+
+# per marker and clean results.
+p_adj_df_uc <- p_adj_uc %>%
+    as.data.frame() %>%
+    rownames_to_column("variable") %>%
+    pivot_longer(-variable, names_to = "cluster", values_to = "p_adj")
+
+cor_tidy_uc <- cor_results_uc %>%
+    as.data.frame() %>%
+    rownames_to_column("variable") %>%
+    pivot_longer(-variable, names_to = "cluster", values_to = "rho") %>%
+    filter(variable %in% c("crp", "Fcal"))
+
+p_tidy_uc <- p_mat_uc %>%
+    as.data.frame() %>%
+    rownames_to_column("biomarker") %>%
+    pivot_longer(-biomarker, names_to = "cluster", values_to = "p_value") %>%
+    rename(variable = biomarker)
+
+final_results_uc <- cor_tidy_uc %>%
+    left_join(p_tidy_uc, by = c("variable", "cluster")) %>%
+    left_join(p_adj_df_uc, by = c("variable", "cluster")) %>%
+    arrange(variable, p_adj)
+
+final_results_cd$subtype = "CD"
+final_results_uc$subtype = "UC"
+final_lab = bind_rows(final_results_cd, final_results_uc) %>% arrange(cluster)
+
+# Prepare selected CD clusters.
+clusters_inflam_sorted <- final_results_cd %>%
+  filter(cluster %in% boruta_clusters_cd_res_final_confirmed_mets) %>%
+  mutate(Diagnosis = "CD") %>%
+  arrange(variable, cluster)
+
+# Create rho matrix for heatmap.
+rho_mat <- clusters_inflam_sorted %>%
+  dplyr::select(cluster, variable, rho) %>%
+  pivot_wider(
+    names_from = variable,
+    values_from = rho,
+    names_sort = TRUE
+  ) %>%
+  as.data.frame()
+
+rownames(rho_mat) <- paste0("Cluster", rho_mat$cluster)
+rho_mat$cluster <- NULL
+
+# Plot heatmap.
+Heatmap(
+  rho_mat,
+  col = colorRamp2(
+    c(-1, 0, 1),
+    c("#85416E", "#FFEFE0", "#B1CD64")
+  ),
+  name = "rho",
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  row_title = "Clusters",
+  column_title = "",
+  split = split_vector,
+  left_annotation = ha_row,
+  row_gap = unit(3, "mm"),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    grid::grid.text(
+      sprintf("%.2f", rho_mat[i, j]),
+      x = x,
+      y = y,
+      gp = grid::gpar(fontsize = 10, col = "black")
+    )
+  }
+)
+```
